@@ -199,25 +199,25 @@ def parse_direction(value):
     엑셀 방향값을 내부 방향값으로 변환.
 
     예:
-    - 순천종점 -> ["순천"]
-    - 영암기점 -> ["영암"]
-    - 양방향 -> ["순천", "영암"]
+    - 순천종점 -> 순천
+    - 영암기점 -> 영암
+    - 양방향 -> 양방향
     """
     text = clean_text(value).replace(" ", "")
 
     if text == "":
-        return []
+        return ""
 
     if "양방향" in text or text == "양":
-        return ["순천", "영암"]
+        return "양방향"
 
     if "순천" in text:
-        return ["순천"]
+        return "순천"
 
     if "영암" in text:
-        return ["영암"]
+        return "영암"
 
-    return []
+    return ""
 
 
 def parse_km_interval(value):
@@ -231,7 +231,7 @@ def parse_km_interval(value):
     - 0km ~ 106.84km
 
     반환:
-    - (작은 이정, 큰 이정)
+    - 작은 이정, 큰 이정
     """
     text = clean_text(value)
 
@@ -282,21 +282,31 @@ def is_full_range(start, end):
 def parse_lanes(value):
     """
     차단차로 컬럼에서 1차로, 2차로, 갓길만 추출.
+
+    중요:
+    '2차로중 1차로' 같은 표현에서는 '2차로중'의 2차로를 차단차로로 보지 않고,
+    '중' 뒤쪽의 1차로만 차단차로로 인식.
     """
     text = clean_text(value).replace(" ", "")
 
     if text == "":
         return []
 
+    # '2차로중 1차로' 형식이면 '중' 뒤쪽만 실제 차단차로로 사용
+    if "중" in text:
+        target = text.split("중", 1)[1]
+    else:
+        target = text
+
     lanes = []
 
-    if "1차로" in text or "1차" in text:
+    if "1차로" in target or "1차" in target:
         lanes.append("1차로")
 
-    if "2차로" in text or "2차" in text:
+    if "2차로" in target or "2차" in target:
         lanes.append("2차로")
 
-    if "갓길" in text:
+    if "갓길" in target:
         lanes.append("갓길")
 
     # LANES 순서대로 중복 제거
@@ -342,7 +352,12 @@ def parse_excel_to_work_table(
     """
     엑셀 원본에서 도식에 필요한 데이터만 추출.
 
-    양방향은 순천/영암 2개 행으로 분리.
+    기존:
+    - 양방향을 순천/영암 2개 행으로 분리
+
+    현재:
+    - 양방향은 한 행으로 유지
+    - 도식에서만 영암방향/순천방향 양쪽에 표시
     """
     rows = []
     auto_no = 1
@@ -364,9 +379,9 @@ def parse_excel_to_work_table(
 
         start, end = interval
 
-        directions = parse_direction(direction_raw)
+        direction = parse_direction(direction_raw)
 
-        if not directions:
+        if direction == "":
             continue
 
         lanes = parse_lanes(lane_raw)
@@ -388,24 +403,23 @@ def parse_excel_to_work_table(
 
         hide_reason = ",".join(hide_reason_list)
 
-        for direction in directions:
-            rows.append({
-                "표시여부": default_display,
-                "제외사유": hide_reason,
-                "번호": auto_no,
-                "공사명": work_name,
-                "방향": direction,
-                "시점": start,
-                "종점": end,
-                "차로": ",".join(lanes),
-                "그룹명": "",
-                "원본행": raw_idx + 1,
-                "원문방향": direction_raw,
-                "원문공사구간": section_raw,
-                "원문차단차로": lane_raw,
-            })
+        rows.append({
+            "표시여부": default_display,
+            "제외사유": hide_reason,
+            "번호": auto_no,
+            "공사명": work_name,
+            "방향": direction,
+            "시점": start,
+            "종점": end,
+            "차로": ",".join(lanes),
+            "그룹명": "",
+            "원본행": raw_idx + 1,
+            "원문방향": direction_raw,
+            "원문공사구간": section_raw,
+            "원문차단차로": lane_raw,
+        })
 
-            auto_no += 1
+        auto_no += 1
 
     return pd.DataFrame(rows)
 
@@ -451,7 +465,7 @@ def normalize_work_table(df):
 
         direction = clean_text(row.get("방향", ""))
 
-        if direction not in ["순천", "영암"]:
+        if direction not in ["순천", "영암", "양방향"]:
             continue
 
         lanes = lane_text_to_list(row.get("차로", ""))
@@ -491,6 +505,8 @@ def build_work_units(df, use_group=True):
     - 같은 그룹명
     - 같은 방향
     을 하나의 다공종 작업으로 묶음.
+
+    양방향은 양방향끼리 묶임.
     """
     if df.empty:
         return pd.DataFrame()
@@ -561,6 +577,23 @@ def build_work_units(df, use_group=True):
 # =========================================================
 # 10. 겹침 / 인접 판정
 # =========================================================
+def direction_matches(direction_a, direction_b):
+    """
+    같은 방향끼리 검토할 때의 방향 비교.
+
+    - 순천 vs 순천: 비교
+    - 영암 vs 영암: 비교
+    - 양방향 vs 순천: 비교
+    - 양방향 vs 영암: 비교
+    - 양방향 vs 양방향: 비교
+    - 순천 vs 영암: 비교 안 함
+    """
+    if direction_a == "양방향" or direction_b == "양방향":
+        return True
+
+    return direction_a == direction_b
+
+
 def interval_relation(a_start, a_end, b_start, b_end):
     """
     두 구간의 겹침 또는 이격거리 계산.
@@ -603,7 +636,7 @@ def find_conflicts(units, threshold_km=5.0, same_direction_only=True, consider_l
         a = units.loc[i]
         b = units.loc[j]
 
-        if same_direction_only and a["방향"] != b["방향"]:
+        if same_direction_only and not direction_matches(a["방향"], b["방향"]):
             continue
 
         if consider_lane:
@@ -618,7 +651,7 @@ def find_conflicts(units, threshold_km=5.0, same_direction_only=True, consider_l
             conflicts.append({
                 "작업1": f"{a['번호표시']} {a['공사명']}",
                 "작업2": f"{b['번호표시']} {b['공사명']}",
-                "방향": a["방향"] if a["방향"] == b["방향"] else "양방향",
+                "방향": a["방향"] if a["방향"] == b["방향"] else "양방향 포함",
                 "구분": "구간 겹침",
                 "문제구간": f"{relation['start']:.1f}k ~ {relation['end']:.1f}k",
                 "이격거리(km)": 0.0,
@@ -633,7 +666,7 @@ def find_conflicts(units, threshold_km=5.0, same_direction_only=True, consider_l
             conflicts.append({
                 "작업1": f"{a['번호표시']} {a['공사명']}",
                 "작업2": f"{b['번호표시']} {b['공사명']}",
-                "방향": a["방향"] if a["방향"] == b["방향"] else "양방향",
+                "방향": a["방향"] if a["방향"] == b["방향"] else "양방향 포함",
                 "구분": f"{threshold_km:g}km 이내 인접",
                 "문제구간": f"{relation['start']:.1f}k ~ {relation['end']:.1f}k",
                 "이격거리(km)": round(relation["distance"], 2),
@@ -684,6 +717,11 @@ def get_lane_y_range(direction, lanes):
 def draw_diagram(units, conflicts, show_warnings=True, submit_mode=False):
     """
     공사구간 도식 생성.
+
+    양방향 작업은:
+    - 영암방향 위쪽
+    - 순천방향 아래쪽
+    두 군데 모두 표시.
     """
     fig, ax = plt.subplots(figsize=(15, 4.8), dpi=160)
 
@@ -756,59 +794,65 @@ def draw_diagram(units, conflicts, show_warnings=True, submit_mode=False):
 
     # 작업 박스
     for _, row in units.iterrows():
-        lane_range = get_lane_y_range(row["방향"], row["차로"])
-
-        if lane_range is None:
-            continue
-
-        y0, y1 = lane_range
-
-        x0 = row["시점"]
-        width = row["종점"] - row["시점"]
-        height = y1 - y0
-
-        is_warning = show_warnings and row["unit_id"] in conflict_unit_ids
-
-        edge_color = "red" if is_warning else "black"
-        line_width = 2.0 if is_warning else 1.0
-
-        rect = Rectangle(
-            (x0, y0),
-            width,
-            height,
-            facecolor="#BFBFBF",
-            edgecolor=edge_color,
-            linewidth=line_width,
-            zorder=3,
-        )
-
-        ax.add_patch(rect)
-
-        # 박스 안 텍스트
-        if row["다공종여부"]:
-            if width >= 8:
-                label = f"{row['그룹명']}\n{row['번호표시']}\n다공종"
-                fontsize = 7
-            else:
-                label = f"{row['그룹명']}\n{row['번호표시']}"
-                fontsize = 7
+        if row["방향"] == "양방향":
+            draw_directions = ["영암", "순천"]
         else:
-            if width >= 8 and not submit_mode:
-                label = f"{row['번호표시']}\n{row['공사명']}"
-                fontsize = 7
-            else:
-                label = f"{row['번호표시']}"
-                fontsize = 9
+            draw_directions = [row["방향"]]
 
-        ax.text(
-            x0 + width / 2,
-            y0 + height / 2,
-            label,
-            fontsize=fontsize,
-            ha="center",
-            va="center",
-            zorder=4,
-        )
+        for draw_direction in draw_directions:
+            lane_range = get_lane_y_range(draw_direction, row["차로"])
+
+            if lane_range is None:
+                continue
+
+            y0, y1 = lane_range
+
+            x0 = row["시점"]
+            width = row["종점"] - row["시점"]
+            height = y1 - y0
+
+            is_warning = show_warnings and row["unit_id"] in conflict_unit_ids
+
+            edge_color = "red" if is_warning else "black"
+            line_width = 2.0 if is_warning else 1.0
+
+            rect = Rectangle(
+                (x0, y0),
+                width,
+                height,
+                facecolor="#BFBFBF",
+                edgecolor=edge_color,
+                linewidth=line_width,
+                zorder=3,
+            )
+
+            ax.add_patch(rect)
+
+            # 박스 안 텍스트
+            if row["다공종여부"]:
+                if width >= 8:
+                    label = f"{row['그룹명']}\n{row['번호표시']}\n다공종"
+                    fontsize = 7
+                else:
+                    label = f"{row['그룹명']}\n{row['번호표시']}"
+                    fontsize = 7
+            else:
+                if width >= 8 and not submit_mode:
+                    label = f"{row['번호표시']}\n{row['공사명']}"
+                    fontsize = 7
+                else:
+                    label = f"{row['번호표시']}"
+                    fontsize = 9
+
+            ax.text(
+                x0 + width / 2,
+                y0 + height / 2,
+                label,
+                fontsize=fontsize,
+                ha="center",
+                va="center",
+                zorder=4,
+            )
 
     if show_warnings:
         ax.text(
@@ -1011,6 +1055,7 @@ st.subheader("표시할 공사 선택")
 
 st.caption(
     "도식에 포함할 공사만 표시여부를 체크하세요. "
+    "방향은 순천, 영암, 양방향 중 선택할 수 있습니다. "
     "같이 묶어 진행할 작업은 그룹명에 같은 값을 입력하면 됩니다."
 )
 
@@ -1045,7 +1090,7 @@ edited_df = st.data_editor(
         "공사명": st.column_config.TextColumn("공사명"),
         "방향": st.column_config.SelectboxColumn(
             "방향",
-            options=["순천", "영암"],
+            options=["순천", "영암", "양방향"],
         ),
         "시점": st.column_config.NumberColumn(
             "시점(km)",
@@ -1142,7 +1187,8 @@ with tab2:
     st.subheader("다공종 묶음 결과")
 
     st.caption(
-        "그룹명이 같은 작업은 같은 방향 기준으로 하나의 다공종 작업으로 묶입니다."
+        "그룹명이 같은 작업은 같은 방향 기준으로 하나의 다공종 작업으로 묶입니다. "
+        "양방향 작업은 양방향끼리 묶입니다."
     )
 
     st.dataframe(
