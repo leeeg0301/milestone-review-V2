@@ -111,6 +111,20 @@ def make_unique_columns(columns):
 # =========================================================
 # 4. 엑셀 읽기: 헤더 자동 탐색
 # =========================================================
+def get_excel_engine(uploaded_file):
+    """
+    파일 확장자에 따라 엑셀 읽기 엔진 선택.
+    .xls  -> xlrd
+    .xlsx -> openpyxl
+    """
+    file_name = uploaded_file.name.lower()
+
+    if file_name.endswith(".xls"):
+        return "xlrd"
+
+    return "openpyxl"
+
+
 def read_excel_smart(uploaded_file, sheet_name):
     """
     도로공사 작업계획서처럼 상단에 제목/공백이 있고,
@@ -123,11 +137,13 @@ def read_excel_smart(uploaded_file, sheet_name):
     - 차단차로
     """
     uploaded_file.seek(0)
+    engine = get_excel_engine(uploaded_file)
 
     probe_df = pd.read_excel(
         uploaded_file,
         sheet_name=sheet_name,
         header=None,
+        engine=engine,
     )
 
     header_row_idx = None
@@ -224,7 +240,7 @@ def parse_km_interval(value):
 
     text = text.replace(",", "")
 
-    # 1차: km/k/㎞ 앞 숫자를 우선 추출
+    # 1차: km/k/㎞ 앞 숫자 추출
     km_pattern = r"(\d+(?:\.\d+)?)\s*(?:k|K|km|KM|㎞)"
     nums = re.findall(km_pattern, text)
 
@@ -266,7 +282,6 @@ def is_full_range(start, end):
 def parse_lanes(value):
     """
     차단차로 컬럼에서 1차로, 2차로, 갓길만 추출.
-    이동차단은 차로로 표시하지 않음.
     """
     text = clean_text(value).replace(" ", "")
 
@@ -286,6 +301,7 @@ def parse_lanes(value):
 
     # LANES 순서대로 중복 제거
     result = []
+
     for lane in LANES:
         if lane in lanes and lane not in result:
             result.append(lane)
@@ -808,16 +824,20 @@ def draw_diagram(units, conflicts, show_warnings=True, submit_mode=False):
 
 
 # =========================================================
-# 12. Streamlit 화면
+# 12. Streamlit 화면 - Simple Version
 # =========================================================
 st.set_page_config(
-    page_title="보성지사 공사구간 도식 생성기 V2",
+    page_title="보성지사 공사구간 도식 생성기",
     layout="wide",
 )
 
-st.title("보성지사 공사구간 도식 생성기 V2")
-st.caption("엑셀 업로드 기반 / 영암순천선 0k ~ 106.84k / 다공종 그룹 처리 / 검토용·제출용 출력")
+st.title("보성지사 공사구간 도식 생성기")
+st.caption("엑셀 업로드 → 표시할 공사 선택 → 공사현황도 생성")
 
+
+# -----------------------------
+# 사이드바 설정
+# -----------------------------
 with st.sidebar:
     st.header("설정")
 
@@ -850,72 +870,90 @@ with st.sidebar:
         value=False,
     )
 
-    st.markdown("---")
-    st.subheader("자동 미표시 조건")
+    with st.expander("자동 미표시 조건"):
+        hide_full_range = st.checkbox(
+            "0~106.84 전체구간 기본 미표시",
+            value=True,
+        )
 
-    hide_full_range = st.checkbox(
-        "0~106.84 전체구간 기본 미표시",
-        value=True,
-    )
+        hide_moving_closure = st.checkbox(
+            "이동차단 작업 기본 미표시",
+            value=True,
+        )
 
-    hide_moving_closure = st.checkbox(
-        "이동차단 작업 기본 미표시",
-        value=True,
-    )
-
-    hide_no_lane = st.checkbox(
-        "차로정보 없는 작업 기본 미표시",
-        value=True,
-    )
-
-    st.markdown("---")
-    st.markdown("""
-    **방향 변환**
-    - 순천종점 → 순천방향
-    - 영암기점 → 영암방향
-    - 양방향 → 순천 + 영암 둘 다 생성
-
-    **이정 처리**
-    - 공사구간에서 숫자 2개 추출
-    - 방향과 관계없이 작은 km ~ 큰 km로 도식화
-
-    **제출용**
-    - 경고 음영과 빨간 테두리 숨김
-    """)
+        hide_no_lane = st.checkbox(
+            "차로정보 없는 작업 기본 미표시",
+            value=True,
+        )
 
 
-st.subheader("1. 엑셀 업로드")
-
+# -----------------------------
+# 1. 엑셀 업로드
+# -----------------------------
 uploaded_file = st.file_uploader(
     "작업계획 엑셀 파일을 업로드하세요. (.xls / .xlsx)",
     type=["xls", "xlsx"],
 )
 
-parsed_df = pd.DataFrame()
+if uploaded_file is None:
+    st.info("엑셀 파일을 업로드하면 공사구간이 자동으로 추출됩니다.")
+    st.stop()
 
-if uploaded_file is not None:
+
+# -----------------------------
+# 2. 엑셀 읽기
+# -----------------------------
+try:
     uploaded_file.seek(0)
-    excel_file = pd.ExcelFile(uploaded_file)
-    sheet_name = st.selectbox("시트 선택", excel_file.sheet_names)
+    engine = get_excel_engine(uploaded_file)
+
+    excel_file = pd.ExcelFile(
+        uploaded_file,
+        engine=engine,
+    )
+
+    sheet_name = st.selectbox(
+        "시트 선택",
+        excel_file.sheet_names,
+    )
 
     raw_df = read_excel_smart(uploaded_file, sheet_name)
 
-    if raw_df.empty:
-        st.error("엑셀에서 공사명/방향/공사구간/차단차로 헤더를 찾지 못했습니다.")
-        st.stop()
+except ImportError:
+    st.error(
+        "엑셀 파일을 읽는 데 필요한 패키지가 없습니다. "
+        "requirements.txt에 xlrd와 openpyxl을 추가하세요."
+    )
 
-    st.markdown("#### 원본 엑셀 미리보기")
-    st.dataframe(raw_df.head(30), use_container_width=True)
+    st.code(
+        "streamlit\npandas\nmatplotlib\nopenpyxl\nxlrd\nnumpy",
+        language="text",
+    )
 
-    columns = list(raw_df.columns)
+    st.stop()
 
-    default_name_col = guess_column(columns, ["공사명", "공사", "내용"])
-    default_direction_col = guess_column(columns, ["방향"])
-    default_section_col = guess_column(columns, ["공사구간", "구간", "이정"])
-    default_lane_col = guess_column(columns, ["차단차로", "차로"])
+except Exception as e:
+    st.error("엑셀 파일을 읽는 중 오류가 발생했습니다.")
+    st.exception(e)
+    st.stop()
 
-    st.markdown("#### 컬럼 매칭")
 
+if raw_df.empty:
+    st.error("엑셀에서 공사명 / 방향 / 공사구간 / 차단차로 헤더를 찾지 못했습니다.")
+    st.stop()
+
+
+# -----------------------------
+# 3. 컬럼 자동 매칭
+# -----------------------------
+columns = list(raw_df.columns)
+
+default_name_col = guess_column(columns, ["공사명", "공사", "내용"])
+default_direction_col = guess_column(columns, ["방향"])
+default_section_col = guess_column(columns, ["공사구간", "구간", "이정"])
+default_lane_col = guess_column(columns, ["차단차로", "차로"])
+
+with st.expander("컬럼 매칭 확인 / 수정"):
     col1, col2, col3, col4 = st.columns(4)
 
     with col1:
@@ -946,263 +984,204 @@ if uploaded_file is not None:
             index=columns.index(default_lane_col),
         )
 
-    parsed_df = parse_excel_to_work_table(
-        raw_df,
-        name_col=name_col,
-        direction_col=direction_col,
-        section_col=section_col,
-        lane_col=lane_col,
-        hide_full_range=hide_full_range,
-        hide_moving_closure=hide_moving_closure,
-        hide_no_lane=hide_no_lane,
-    )
 
-else:
-    st.info("엑셀 파일을 업로드하면 자동으로 공사구간을 추출합니다.")
-
-    parsed_df = pd.DataFrame([
-        {
-            "표시여부": True,
-            "제외사유": "",
-            "번호": 1,
-            "공사명": "해룡교 교통통제 및 교량점검차 조사",
-            "방향": "순천",
-            "시점": 103.18,
-            "종점": 104.87,
-            "차로": "2차로",
-            "그룹명": "",
-            "원본행": 1,
-            "원문방향": "순천종점",
-            "원문공사구간": "103.18km ~ 104.87km",
-            "원문차단차로": "2차로중 2차로",
-        },
-        {
-            "표시여부": False,
-            "제외사유": "이동차단",
-            "번호": 2,
-            "공사명": "단터널 소화기 이동식차단 점검",
-            "방향": "순천",
-            "시점": 2.3,
-            "종점": 95.0,
-            "차로": "2차로",
-            "그룹명": "",
-            "원본행": 2,
-            "원문방향": "순천종점",
-            "원문공사구간": "2.3km ~ 95km",
-            "원문차단차로": "2차로중 2차로, 이동차단",
-        },
-        {
-            "표시여부": False,
-            "제외사유": "전체구간,이동차단",
-            "번호": 3,
-            "공사명": "일상유지보수 작업",
-            "방향": "순천",
-            "시점": 0.0,
-            "종점": 106.84,
-            "차로": "1차로,2차로,갓길",
-            "그룹명": "",
-            "원본행": 3,
-            "원문방향": "양방향",
-            "원문공사구간": "0km ~ 106.84km",
-            "원문차단차로": "2차로중 1차로, 2차로, 이동차단, 갓길",
-        },
-        {
-            "표시여부": False,
-            "제외사유": "전체구간,이동차단",
-            "번호": 4,
-            "공사명": "일상유지보수 작업",
-            "방향": "영암",
-            "시점": 0.0,
-            "종점": 106.84,
-            "차로": "1차로,2차로,갓길",
-            "그룹명": "",
-            "원본행": 3,
-            "원문방향": "양방향",
-            "원문공사구간": "0km ~ 106.84km",
-            "원문차단차로": "2차로중 1차로, 2차로, 이동차단, 갓길",
-        },
-        {
-            "표시여부": True,
-            "제외사유": "",
-            "번호": 5,
-            "공사명": "정밀안전점검 및 성능평가 용역",
-            "방향": "영암",
-            "시점": 49.3,
-            "종점": 62.7,
-            "차로": "2차로,갓길",
-            "그룹명": "",
-            "원본행": 5,
-            "원문방향": "영암기점",
-            "원문공사구간": "49.3km ~ 62.7km",
-            "원문차단차로": "2차로중 2차로, 갓길",
-        },
-    ])
-
-
-st.subheader("2. 자동 추출 결과 수정")
+# -----------------------------
+# 4. 엑셀 원본 → 작업표 추출
+# -----------------------------
+parsed_df = parse_excel_to_work_table(
+    raw_df,
+    name_col=name_col,
+    direction_col=direction_col,
+    section_col=section_col,
+    lane_col=lane_col,
+    hide_full_range=hide_full_range,
+    hide_moving_closure=hide_moving_closure,
+    hide_no_lane=hide_no_lane,
+)
 
 if parsed_df.empty:
-    st.warning("추출된 공사구간이 없습니다. 컬럼 매칭 또는 원본 엑셀 내용을 확인하세요.")
-else:
-    total_count = len(parsed_df)
-    display_count = int(parsed_df["표시여부"].sum()) if "표시여부" in parsed_df.columns else 0
-    hidden_count = total_count - display_count
+    st.warning("추출된 공사구간이 없습니다. 엑셀 내용 또는 컬럼 매칭을 확인하세요.")
+    st.stop()
 
-    m1, m2, m3 = st.columns(3)
-    m1.metric("추출 작업 수", total_count)
-    m2.metric("기본 표시", display_count)
-    m3.metric("기본 미표시", hidden_count)
 
-    search_text = st.text_input(
-        "공사명 검색",
-        value="",
-        placeholder="공사가 많을 때 공사명을 입력해서 검색하세요.",
+# -----------------------------
+# 5. 사용자가 표시할 공사 선택
+# -----------------------------
+st.subheader("표시할 공사 선택")
+
+st.caption(
+    "도식에 포함할 공사만 표시여부를 체크하세요. "
+    "같이 묶어 진행할 작업은 그룹명에 같은 값을 입력하면 됩니다."
+)
+
+editor_columns = [
+    "표시여부",
+    "번호",
+    "공사명",
+    "방향",
+    "시점",
+    "종점",
+    "차로",
+    "그룹명",
+    "제외사유",
+]
+
+edited_df = st.data_editor(
+    parsed_df[editor_columns],
+    num_rows="dynamic",
+    use_container_width=True,
+    height=430,
+    column_config={
+        "표시여부": st.column_config.CheckboxColumn(
+            "표시",
+            help="도식에 표시할 공사만 체크하세요.",
+            default=True,
+        ),
+        "번호": st.column_config.NumberColumn(
+            "번호",
+            min_value=1,
+            step=1,
+        ),
+        "공사명": st.column_config.TextColumn("공사명"),
+        "방향": st.column_config.SelectboxColumn(
+            "방향",
+            options=["순천", "영암"],
+        ),
+        "시점": st.column_config.NumberColumn(
+            "시점(km)",
+            min_value=0.0,
+            max_value=ROAD_END,
+            step=0.1,
+        ),
+        "종점": st.column_config.NumberColumn(
+            "종점(km)",
+            min_value=0.0,
+            max_value=ROAD_END,
+            step=0.1,
+        ),
+        "차로": st.column_config.TextColumn(
+            "차로",
+            help="예: 1차로 / 2차로 / 갓길 / 1차로,2차로",
+        ),
+        "그룹명": st.column_config.TextColumn(
+            "다공종 그룹명",
+            help="같이 묶을 작업은 같은 그룹명을 입력하세요. 예: A",
+        ),
+        "제외사유": st.column_config.TextColumn(
+            "기본 제외사유",
+            disabled=True,
+        ),
+    },
+    key="simple_editor",
+)
+
+
+# -----------------------------
+# 6. 내부 계산
+# -----------------------------
+work_df = normalize_work_table(edited_df)
+
+if work_df.empty:
+    st.warning("표시 대상으로 선택된 공사가 없습니다.")
+    st.stop()
+
+units_df = build_work_units(
+    work_df,
+    use_group=use_group,
+)
+
+conflicts = find_conflicts(
+    units_df,
+    threshold_km=threshold,
+    same_direction_only=same_direction_only,
+    consider_lane=consider_lane,
+)
+
+show_warnings = output_mode == "검토용"
+
+
+# -----------------------------
+# 7. 결과 탭
+# -----------------------------
+tab1, tab2, tab3 = st.tabs(
+    ["공사현황도", "다공종 묶음 결과", "겹침/인접 판정"]
+)
+
+
+with tab1:
+    st.subheader("공사구간 도식")
+
+    fig = draw_diagram(
+        units_df,
+        conflicts,
+        show_warnings=show_warnings,
+        submit_mode=(output_mode == "제출용"),
     )
 
-    filter_option = st.radio(
-        "표시 필터",
-        ["전체", "표시 대상만", "미표시 대상만"],
-        horizontal=True,
+    st.pyplot(fig, use_container_width=True)
+
+    buffer = io.BytesIO()
+    fig.savefig(buffer, format="png", bbox_inches="tight")
+    buffer.seek(0)
+
+    file_name = (
+        "bosung_work_diagram_review.png"
+        if output_mode == "검토용"
+        else "bosung_work_diagram_submit.png"
     )
 
-    view_df = parsed_df.copy()
+    st.download_button(
+        label="PNG 이미지 다운로드",
+        data=buffer,
+        file_name=file_name,
+        mime="image/png",
+    )
 
-    if search_text.strip() != "":
-        mask = view_df["공사명"].astype(str).str.contains(search_text.strip(), case=False, na=False)
-        view_df = view_df[mask]
 
-    if filter_option == "표시 대상만":
-        view_df = view_df[view_df["표시여부"] == True]
-    elif filter_option == "미표시 대상만":
-        view_df = view_df[view_df["표시여부"] == False]
+with tab2:
+    st.subheader("다공종 묶음 결과")
 
-    st.caption("아래 표에서 표시여부를 끄면 도식에서 제외됩니다. 그룹명을 입력하면 다공종 작업으로 묶입니다.")
+    st.caption(
+        "그룹명이 같은 작업은 같은 방향 기준으로 하나의 다공종 작업으로 묶입니다."
+    )
 
-    edited_view_df = st.data_editor(
-        view_df,
-        num_rows="dynamic",
+    st.dataframe(
+        units_df[[
+            "번호표시",
+            "공사명",
+            "상세공사명",
+            "방향",
+            "시점",
+            "종점",
+            "차로표시",
+            "그룹명",
+            "다공종여부",
+        ]],
         use_container_width=True,
-        height=420,
-        column_config={
-            "표시여부": st.column_config.CheckboxColumn(
-                "표시",
-                help="도식에 표시할 공사만 체크하세요.",
-                default=True,
-            ),
-            "제외사유": st.column_config.TextColumn("기본 제외사유"),
-            "번호": st.column_config.NumberColumn("번호", min_value=1, step=1),
-            "공사명": st.column_config.TextColumn("공사명"),
-            "방향": st.column_config.SelectboxColumn("방향", options=["순천", "영암"]),
-            "시점": st.column_config.NumberColumn("시점(km)", min_value=0.0, max_value=ROAD_END, step=0.1),
-            "종점": st.column_config.NumberColumn("종점(km)", min_value=0.0, max_value=ROAD_END, step=0.1),
-            "차로": st.column_config.TextColumn("차로 예: 1차로 / 2차로 / 갓길 / 1차로,2차로"),
-            "그룹명": st.column_config.TextColumn("다공종 그룹명 예: A, B"),
-            "원본행": st.column_config.NumberColumn("원본행"),
-            "원문방향": st.column_config.TextColumn("원문방향"),
-            "원문공사구간": st.column_config.TextColumn("원문공사구간"),
-            "원문차단차로": st.column_config.TextColumn("원문차단차로"),
-        },
-        key="edited_view_df",
+        height=360,
     )
 
-    # 필터링된 화면에서 수정한 내용을 원본 parsed_df에 반영
-    parsed_df.update(edited_view_df)
 
-    work_df = normalize_work_table(parsed_df)
+with tab3:
+    st.subheader("겹침 / 인접 판정")
 
-    units_df = build_work_units(
-        work_df,
-        use_group=use_group,
-    )
+    if output_mode == "제출용":
+        st.info("제출용 모드에서는 도식에 경고 음영과 빨간 테두리를 표시하지 않습니다.")
 
-    show_warnings = output_mode == "검토용"
-
-    st.subheader("3. 도식 반영 대상")
-
-    if work_df.empty:
-        st.warning("표시 대상으로 선택된 공사가 없습니다.")
+    if conflicts.empty:
+        st.success("겹치는 구간 또는 기준 거리 이내 인접 구간이 없습니다.")
     else:
+        st.warning(f"주의가 필요한 구간이 {len(conflicts)}건 있습니다.")
+
         st.dataframe(
-            work_df[["번호", "공사명", "방향", "시점", "종점", "차로표시", "그룹명"]],
+            conflicts[[
+                "작업1",
+                "작업2",
+                "방향",
+                "구분",
+                "문제구간",
+                "이격거리(km)",
+            ]],
             use_container_width=True,
-            height=260,
+            height=360,
         )
-
-        st.subheader("4. 다공종 묶음 결과")
-
-        if units_df.empty:
-            st.warning("도식화할 작업 단위가 없습니다.")
-        else:
-            st.dataframe(
-                units_df[[
-                    "번호표시",
-                    "공사명",
-                    "상세공사명",
-                    "방향",
-                    "시점",
-                    "종점",
-                    "차로표시",
-                    "그룹명",
-                    "다공종여부",
-                ]],
-                use_container_width=True,
-                height=260,
-            )
-
-            conflicts = find_conflicts(
-                units_df,
-                threshold_km=threshold,
-                same_direction_only=same_direction_only,
-                consider_lane=consider_lane,
-            )
-
-            st.subheader("5. 겹침 / 인접 판정")
-
-            if output_mode == "검토용":
-                if conflicts.empty:
-                    st.success("겹치는 구간 또는 기준 거리 이내 인접 구간이 없습니다.")
-                else:
-                    st.error(f"주의가 필요한 구간이 {len(conflicts)}건 확인되었습니다.")
-
-                    st.dataframe(
-                        conflicts[[
-                            "작업1",
-                            "작업2",
-                            "방향",
-                            "구분",
-                            "문제구간",
-                            "이격거리(km)",
-                        ]],
-                        use_container_width=True,
-                        height=260,
-                    )
-            else:
-                st.info("제출용 모드입니다. 경고 음영과 빨간 테두리는 표시하지 않습니다.")
-
-            st.subheader("6. 공사구간 도식")
-
-            fig = draw_diagram(
-                units_df,
-                conflicts,
-                show_warnings=show_warnings,
-                submit_mode=(output_mode == "제출용"),
-            )
-
-            st.pyplot(fig, use_container_width=True)
-
-            buffer = io.BytesIO()
-            fig.savefig(buffer, format="png", bbox_inches="tight")
-            buffer.seek(0)
-
-            file_name = (
-                "bosung_work_diagram_v2_review.png"
-                if output_mode == "검토용"
-                else "bosung_work_diagram_v2_submit.png"
-            )
-
-            st.download_button(
-                label="PNG 이미지 다운로드",
-                data=buffer,
-                file_name=file_name,
-                mime="image/png",
-            )
