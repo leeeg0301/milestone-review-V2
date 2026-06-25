@@ -74,7 +74,6 @@ def clean_text(value):
 def clean_group_name(value):
     """
     그룹명 빈칸은 그룹 없음으로 처리.
-    빈칸끼리 nan 그룹으로 묶이는 문제 방지.
     """
     text = clean_text(value)
 
@@ -109,7 +108,7 @@ def make_unique_columns(columns):
 
 
 # =========================================================
-# 4. 엑셀 읽기: 헤더 자동 탐색
+# 4. 엑셀 읽기: 모든 시트/페이지 자동 포함
 # =========================================================
 def get_excel_engine(uploaded_file):
     """
@@ -125,29 +124,10 @@ def get_excel_engine(uploaded_file):
     return "openpyxl"
 
 
-def read_excel_smart(uploaded_file, sheet_name):
+def find_header_row(probe_df):
     """
-    도로공사 작업계획서처럼 상단에 제목/공백이 있고,
-    실제 헤더가 중간에 있는 엑셀을 자동으로 읽음.
-
-    실제 헤더 행에서 아래 항목을 탐색:
-    - 공사명
-    - 방향
-    - 공사구간
-    - 차단차로
+    공사명 / 방향 / 공사구간 / 차단차로가 있는 행을 실제 헤더로 판단.
     """
-    uploaded_file.seek(0)
-    engine = get_excel_engine(uploaded_file)
-
-    probe_df = pd.read_excel(
-        uploaded_file,
-        sheet_name=sheet_name,
-        header=None,
-        engine=engine,
-    )
-
-    header_row_idx = None
-
     for idx, row in probe_df.iterrows():
         values = [clean_text(v).replace(" ", "") for v in row.tolist()]
 
@@ -159,8 +139,54 @@ def read_excel_smart(uploaded_file, sheet_name):
         score = sum([has_work_name, has_direction, has_section, has_lane])
 
         if score >= 3:
-            header_row_idx = idx
-            break
+            return idx
+
+    return None
+
+
+def remove_repeated_header_rows(df):
+    """
+    인쇄 페이지가 나뉘면서 중간에 반복되는 헤더 행을 제거.
+    """
+    if df.empty:
+        return df
+
+    keep_rows = []
+
+    for _, row in df.iterrows():
+        values = [clean_text(v).replace(" ", "") for v in row.tolist()]
+
+        has_work_name = any(v == "공사명" or "공사명" in v for v in values)
+        has_direction = any(v == "방향" or "방향" in v for v in values)
+        has_section = any("공사구간" in v or "이정" in v for v in values)
+        has_lane = any("차단차로" in v for v in values)
+
+        is_header_like = sum([has_work_name, has_direction, has_section, has_lane]) >= 3
+
+        if not is_header_like:
+            keep_rows.append(row)
+
+    if not keep_rows:
+        return pd.DataFrame(columns=df.columns)
+
+    return pd.DataFrame(keep_rows).reset_index(drop=True)
+
+
+def read_excel_smart(uploaded_file, sheet_name):
+    """
+    단일 시트를 읽어서 실제 헤더 아래 데이터만 추출.
+    """
+    uploaded_file.seek(0)
+    engine = get_excel_engine(uploaded_file)
+
+    probe_df = pd.read_excel(
+        uploaded_file,
+        sheet_name=sheet_name,
+        header=None,
+        engine=engine,
+    )
+
+    header_row_idx = find_header_row(probe_df)
 
     if header_row_idx is None:
         return pd.DataFrame()
@@ -170,8 +196,41 @@ def read_excel_smart(uploaded_file, sheet_name):
     raw_df = probe_df.iloc[header_row_idx + 1:].copy()
     raw_df.columns = columns
     raw_df = raw_df.dropna(how="all").reset_index(drop=True)
+    raw_df = remove_repeated_header_rows(raw_df)
 
     return raw_df
+
+
+def read_all_sheets_smart(uploaded_file):
+    """
+    엑셀 파일 안의 모든 시트를 읽어서 하나의 DataFrame으로 합침.
+    페이지 1, 페이지 2가 각각 시트로 나뉘어 있어도 모두 포함.
+    """
+    uploaded_file.seek(0)
+    engine = get_excel_engine(uploaded_file)
+
+    excel_file = pd.ExcelFile(
+        uploaded_file,
+        engine=engine,
+    )
+
+    all_dfs = []
+
+    for sheet_name in excel_file.sheet_names:
+        sheet_df = read_excel_smart(uploaded_file, sheet_name)
+
+        if sheet_df.empty:
+            continue
+
+        sheet_df.insert(0, "원본시트", sheet_name)
+        all_dfs.append(sheet_df)
+
+    if not all_dfs:
+        return pd.DataFrame()
+
+    merged_df = pd.concat(all_dfs, ignore_index=True)
+
+    return merged_df
 
 
 # =========================================================
@@ -198,10 +257,9 @@ def parse_direction(value):
     """
     엑셀 방향값을 내부 방향값으로 변환.
 
-    예:
-    - 순천종점 -> 순천
-    - 영암기점 -> 영암
-    - 양방향 -> 양방향
+    순천종점 -> 순천
+    영암기점 -> 영암
+    양방향 -> 양방향
     """
     text = clean_text(value).replace(" ", "")
 
@@ -223,15 +281,7 @@ def parse_direction(value):
 def parse_km_interval(value):
     """
     공사구간 문자열에서 이정 숫자 2개를 추출.
-
-    예:
-    - 103.18km ~ 104.87km
-    - 49.3km ~ 62.7km
-    - 95km ~ 2.3km
-    - 0km ~ 106.84km
-
-    반환:
-    - 작은 이정, 큰 이정
+    방향과 관계없이 작은 km ~ 큰 km로 정리.
     """
     text = clean_text(value)
 
@@ -240,11 +290,9 @@ def parse_km_interval(value):
 
     text = text.replace(",", "")
 
-    # 1차: km/k/㎞ 앞 숫자 추출
     km_pattern = r"(\d+(?:\.\d+)?)\s*(?:k|K|km|KM|㎞)"
     nums = re.findall(km_pattern, text)
 
-    # 2차: k 표기가 없으면 일반 숫자 추출
     if len(nums) < 2:
         nums = re.findall(r"\d+(?:\.\d+)?", text)
 
@@ -257,11 +305,9 @@ def parse_km_interval(value):
     draw_start = min(start, end)
     draw_end = max(start, end)
 
-    # 관리구간과 아예 겹치지 않으면 제외
     if draw_end <= ROAD_START or draw_start >= ROAD_END:
         return None
 
-    # 관리구간 밖으로 살짝 넘어가는 경우 잘라냄
     draw_start = max(draw_start, ROAD_START)
     draw_end = min(draw_end, ROAD_END)
 
@@ -273,8 +319,7 @@ def parse_km_interval(value):
 
 def is_full_range(start, end):
     """
-    0~106.84 전체 구간이면 기본 미표시 처리.
-    약간의 오차 허용.
+    0~106.84 전체 구간이면 기본 미표시.
     """
     return start <= 0.1 and end >= ROAD_END - 0.2
 
@@ -283,16 +328,15 @@ def parse_lanes(value):
     """
     차단차로 컬럼에서 1차로, 2차로, 갓길만 추출.
 
-    중요:
-    '2차로중 1차로' 같은 표현에서는 '2차로중'의 2차로를 차단차로로 보지 않고,
-    '중' 뒤쪽의 1차로만 차단차로로 인식.
+    예:
+    - 2차로중 1차로 -> 1차로
+    - 2차로중 2차로, 갓길 -> 2차로, 갓길
     """
     text = clean_text(value).replace(" ", "")
 
     if text == "":
         return []
 
-    # '2차로중 1차로' 형식이면 '중' 뒤쪽만 실제 차단차로로 사용
     if "중" in text:
         target = text.split("중", 1)[1]
     else:
@@ -309,7 +353,6 @@ def parse_lanes(value):
     if "갓길" in target:
         lanes.append("갓길")
 
-    # LANES 순서대로 중복 제거
     result = []
 
     for lane in LANES:
@@ -322,7 +365,6 @@ def parse_lanes(value):
 def has_moving_closure(value):
     """
     이동차단 포함 여부 확인.
-    이동차단은 광범위하게 잡히는 경우가 많아 기본 미표시 처리에 활용.
     """
     text = clean_text(value).replace(" ", "")
 
@@ -331,7 +373,7 @@ def has_moving_closure(value):
 
 def lane_text_to_list(value):
     """
-    사용자가 data_editor에서 수정한 차로 문자열을 다시 리스트로 변환.
+    사용자가 표에서 수정한 차로 문자열을 다시 리스트로 변환.
     """
     return parse_lanes(value)
 
@@ -351,13 +393,7 @@ def parse_excel_to_work_table(
 ):
     """
     엑셀 원본에서 도식에 필요한 데이터만 추출.
-
-    기존:
-    - 양방향을 순천/영암 2개 행으로 분리
-
-    현재:
-    - 양방향은 한 행으로 유지
-    - 도식에서만 영암방향/순천방향 양쪽에 표시
+    양방향은 한 행으로 유지.
     """
     rows = []
     auto_no = 1
@@ -367,8 +403,8 @@ def parse_excel_to_work_table(
         direction_raw = clean_text(row.get(direction_col, ""))
         section_raw = clean_text(row.get(section_col, ""))
         lane_raw = clean_text(row.get(lane_col, ""))
+        source_sheet = clean_text(row.get("원본시트", ""))
 
-        # 공사명도 없고 구간도 없으면 데이터 행이 아니라고 판단
         if work_name == "" and section_raw == "":
             continue
 
@@ -413,6 +449,7 @@ def parse_excel_to_work_table(
             "종점": end,
             "차로": ",".join(lanes),
             "그룹명": "",
+            "원본시트": source_sheet,
             "원본행": raw_idx + 1,
             "원문방향": direction_raw,
             "원문공사구간": section_raw,
@@ -429,7 +466,7 @@ def parse_excel_to_work_table(
 # =========================================================
 def normalize_work_table(df):
     """
-    사용자가 수정한 작업표에서 표시여부=True인 행만 내부 계산용으로 정리.
+    표시여부=True인 행만 내부 계산용으로 정리.
     """
     rows = []
 
@@ -499,14 +536,8 @@ def normalize_work_table(df):
 # =========================================================
 def build_work_units(df, use_group=True):
     """
-    개별 공사를 실제 검토 단위로 변환.
-
-    그룹명이 같은 경우:
-    - 같은 그룹명
-    - 같은 방향
-    을 하나의 다공종 작업으로 묶음.
-
-    양방향은 양방향끼리 묶임.
+    그룹명이 같은 작업을 하나의 다공종 작업으로 묶음.
+    같은 그룹명 + 같은 방향 기준.
     """
     if df.empty:
         return pd.DataFrame()
@@ -579,14 +610,7 @@ def build_work_units(df, use_group=True):
 # =========================================================
 def direction_matches(direction_a, direction_b):
     """
-    같은 방향끼리 검토할 때의 방향 비교.
-
-    - 순천 vs 순천: 비교
-    - 영암 vs 영암: 비교
-    - 양방향 vs 순천: 비교
-    - 양방향 vs 영암: 비교
-    - 양방향 vs 양방향: 비교
-    - 순천 vs 영암: 비교 안 함
+    양방향은 순천/영암 어느 쪽과도 비교.
     """
     if direction_a == "양방향" or direction_b == "양방향":
         return True
@@ -625,7 +649,7 @@ def interval_relation(a_start, a_end, b_start, b_end):
 
 def find_conflicts(units, threshold_km=5.0, same_direction_only=True, consider_lane=False):
     """
-    모든 작업 단위를 2개씩 비교해서 겹침 또는 기준 km 이내 인접 여부를 찾음.
+    작업 단위끼리 겹침 또는 기준 km 이내 인접 여부를 찾음.
     """
     if units.empty:
         return pd.DataFrame()
@@ -686,9 +710,6 @@ def find_conflicts(units, threshold_km=5.0, same_direction_only=True, consider_l
 def get_lane_y_range(direction, lanes):
     """
     방향과 차로를 y좌표로 변환.
-
-    영암방향: 중앙선 위
-    순천방향: 중앙선 아래
     """
     lane_idx = {
         "1차로": 0,
@@ -717,11 +738,7 @@ def get_lane_y_range(direction, lanes):
 def draw_diagram(units, conflicts, show_warnings=True, submit_mode=False):
     """
     공사구간 도식 생성.
-
-    양방향 작업은:
-    - 영암방향 위쪽
-    - 순천방향 아래쪽
-    두 군데 모두 표시.
+    양방향 작업은 영암/순천 양쪽에 모두 표시.
     """
     fig, ax = plt.subplots(figsize=(15, 4.8), dpi=160)
 
@@ -729,7 +746,6 @@ def draw_diagram(units, conflicts, show_warnings=True, submit_mode=False):
     ax.set_ylim(-3.85, 4.05)
     ax.axis("off")
 
-    # 검토용일 때만 경고 음영 표시
     if show_warnings and conflicts is not None and not conflicts.empty:
         for _, c in conflicts.iterrows():
             if c["type"] == "overlap":
@@ -737,7 +753,6 @@ def draw_diagram(units, conflicts, show_warnings=True, submit_mode=False):
             else:
                 ax.axvspan(c["start"], c["end"], color="orange", alpha=0.13, zorder=0)
 
-    # 세로 격자선
     x_ticks = list(range(0, 101, 10)) + [ROAD_END]
 
     for x in x_ticks:
@@ -745,21 +760,18 @@ def draw_diagram(units, conflicts, show_warnings=True, submit_mode=False):
         lw = 1.2 if major else 0.8
         ax.plot([x, x], [-3, 3], color="black", linewidth=lw, alpha=0.85)
 
-    # 가로 차로선
     for y in [-3, -2, -1, 0, 1, 2, 3]:
         if y == 0:
             ax.plot([0, ROAD_END], [y, y], color="black", linewidth=3.2)
         else:
             ax.plot([0, ROAD_END], [y, y], color="black", linewidth=0.9, alpha=0.8)
 
-    # 이정 숫자
     for x in range(0, 101, 10):
         label = "0k" if x == 0 else f"{x}"
         ax.text(x + 0.4, 3.08, label, fontsize=10, ha="left", va="bottom")
 
     ax.text(ROAD_END, 3.08, "107k", fontsize=10, ha="right", va="bottom")
 
-    # IC 표시
     for name, x in IC_POINTS.items():
         ax.text(
             x,
@@ -772,11 +784,9 @@ def draw_diagram(units, conflicts, show_warnings=True, submit_mode=False):
             va="bottom",
         )
 
-    # 방향 라벨
     ax.text(-1.2, 1.5, "영암\n방향", fontsize=9, ha="right", va="center")
     ax.text(-1.2, -1.5, "순천\n방향", fontsize=9, ha="right", va="center")
 
-    # 차로 라벨
     ax.text(108.0, 0.5, "1차로", fontsize=8, va="center")
     ax.text(108.0, 1.5, "2차로", fontsize=8, va="center")
     ax.text(108.0, 2.5, "갓길", fontsize=8, va="center")
@@ -784,7 +794,6 @@ def draw_diagram(units, conflicts, show_warnings=True, submit_mode=False):
     ax.text(108.0, -1.5, "2차로", fontsize=8, va="center")
     ax.text(108.0, -2.5, "갓길", fontsize=8, va="center")
 
-    # 충돌 대상 ID
     conflict_unit_ids = set()
 
     if show_warnings and conflicts is not None and not conflicts.empty:
@@ -792,7 +801,6 @@ def draw_diagram(units, conflicts, show_warnings=True, submit_mode=False):
             conflict_unit_ids.add(c["unit_id1"])
             conflict_unit_ids.add(c["unit_id2"])
 
-    # 작업 박스
     for _, row in units.iterrows():
         if row["방향"] == "양방향":
             draw_directions = ["영암", "순천"]
@@ -828,7 +836,6 @@ def draw_diagram(units, conflicts, show_warnings=True, submit_mode=False):
 
             ax.add_patch(rect)
 
-            # 박스 안 텍스트
             if row["다공종여부"]:
                 if width >= 8:
                     label = f"{row['그룹명']}\n{row['번호표시']}\n다공종"
@@ -868,7 +875,7 @@ def draw_diagram(units, conflicts, show_warnings=True, submit_mode=False):
 
 
 # =========================================================
-# 12. Streamlit 화면 - Simple Version
+# 12. Streamlit 화면
 # =========================================================
 st.set_page_config(
     page_title="보성지사 공사구간 도식 생성기",
@@ -876,12 +883,9 @@ st.set_page_config(
 )
 
 st.title("보성지사 공사구간 도식 생성기")
-st.caption("엑셀 업로드 → 표시할 공사 선택 → 공사현황도 생성")
+st.caption("엑셀 전체 페이지 자동 포함 → 표시할 공사 선택 → 공사현황도 생성")
 
 
-# -----------------------------
-# 사이드바 설정
-# -----------------------------
 with st.sidebar:
     st.header("설정")
 
@@ -931,37 +935,18 @@ with st.sidebar:
         )
 
 
-# -----------------------------
-# 1. 엑셀 업로드
-# -----------------------------
 uploaded_file = st.file_uploader(
     "작업계획 엑셀 파일을 업로드하세요. (.xls / .xlsx)",
     type=["xls", "xlsx"],
 )
 
 if uploaded_file is None:
-    st.info("엑셀 파일을 업로드하면 공사구간이 자동으로 추출됩니다.")
+    st.info("엑셀 파일을 업로드하면 모든 시트/페이지의 공사구간이 자동으로 추출됩니다.")
     st.stop()
 
 
-# -----------------------------
-# 2. 엑셀 읽기
-# -----------------------------
 try:
-    uploaded_file.seek(0)
-    engine = get_excel_engine(uploaded_file)
-
-    excel_file = pd.ExcelFile(
-        uploaded_file,
-        engine=engine,
-    )
-
-    sheet_name = st.selectbox(
-        "시트 선택",
-        excel_file.sheet_names,
-    )
-
-    raw_df = read_excel_smart(uploaded_file, sheet_name)
+    raw_df = read_all_sheets_smart(uploaded_file)
 
 except ImportError:
     st.error(
@@ -987,9 +972,6 @@ if raw_df.empty:
     st.stop()
 
 
-# -----------------------------
-# 3. 컬럼 자동 매칭
-# -----------------------------
 columns = list(raw_df.columns)
 
 default_name_col = guess_column(columns, ["공사명", "공사", "내용"])
@@ -1029,9 +1011,6 @@ with st.expander("컬럼 매칭 확인 / 수정"):
         )
 
 
-# -----------------------------
-# 4. 엑셀 원본 → 작업표 추출
-# -----------------------------
 parsed_df = parse_excel_to_work_table(
     raw_df,
     name_col=name_col,
@@ -1048,15 +1027,12 @@ if parsed_df.empty:
     st.stop()
 
 
-# -----------------------------
-# 5. 사용자가 표시할 공사 선택
-# -----------------------------
 st.subheader("표시할 공사 선택")
 
 st.caption(
+    "엑셀의 모든 시트/페이지에서 추출된 공사입니다. "
     "도식에 포함할 공사만 표시여부를 체크하세요. "
-    "방향은 순천, 영암, 양방향 중 선택할 수 있습니다. "
-    "같이 묶어 진행할 작업은 그룹명에 같은 값을 입력하면 됩니다."
+    "양방향은 한 행으로 유지되며 도식에서는 순천/영암 양쪽에 표시됩니다."
 )
 
 editor_columns = [
@@ -1069,6 +1045,7 @@ editor_columns = [
     "차로",
     "그룹명",
     "제외사유",
+    "원본시트",
 ]
 
 edited_df = st.data_editor(
@@ -1116,14 +1093,15 @@ edited_df = st.data_editor(
             "기본 제외사유",
             disabled=True,
         ),
+        "원본시트": st.column_config.TextColumn(
+            "원본시트",
+            disabled=True,
+        ),
     },
     key="simple_editor",
 )
 
 
-# -----------------------------
-# 6. 내부 계산
-# -----------------------------
 work_df = normalize_work_table(edited_df)
 
 if work_df.empty:
@@ -1145,9 +1123,6 @@ conflicts = find_conflicts(
 show_warnings = output_mode == "검토용"
 
 
-# -----------------------------
-# 7. 결과 탭
-# -----------------------------
 tab1, tab2, tab3 = st.tabs(
     ["공사현황도", "다공종 묶음 결과", "겹침/인접 판정"]
 )
@@ -1187,8 +1162,7 @@ with tab2:
     st.subheader("다공종 묶음 결과")
 
     st.caption(
-        "그룹명이 같은 작업은 같은 방향 기준으로 하나의 다공종 작업으로 묶입니다. "
-        "양방향 작업은 양방향끼리 묶입니다."
+        "그룹명이 같은 작업은 같은 방향 기준으로 하나의 다공종 작업으로 묶입니다."
     )
 
     st.dataframe(
